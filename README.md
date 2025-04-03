@@ -1,4 +1,4 @@
-from torch.utils.data import DataLoader<div align="center">
+For segmenting small pointclouds see ![eval_small.py](https://github.com/IntellMaps-AI-Team/superpoint_transformer/blob/master/notebooks/eval_small.py), for larger one use ![eval.py](https://github.com/IntellMaps-AI-Team/superpoint_transformer/blob/master/notebooks/eval.py) that implements tiling. Export of blueprints is wip
 
 # Superpoint Transformer
 
