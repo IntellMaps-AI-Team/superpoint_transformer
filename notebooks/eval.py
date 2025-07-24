@@ -64,6 +64,8 @@ def read_vancouver_tile(
     las = laspy.read(filepath)
 
     # Print shape
+    print("las format: ", las.header.point_format)
+    print("las version: ", las.header.version)
     print("Shape: ", las.x.shape)
     print(las[69])
 
@@ -72,15 +74,13 @@ def read_vancouver_tile(
         print("xyz")
         # Apply the scale provided by the LAS header
         # points = np.vstack((las.x, las.y, las.z)).transpose()
-        pos = torch.stack([
-            torch.tensor(las[axis])
-            for axis in ["x", "y", "z"]], dim=-1)
+        coords = np.vstack((las.x, las.y, las.z)).T  # shape (N, 3)
+        pos = torch.from_numpy(coords)
         print(pos[69])
         print(las.header.scale)
         # pos *= las.header.scale
-        pos_offset = pos[0]
-        data.pos = (pos - pos_offset).float()
-        data.pos_offset = pos_offset
+        data.scales = las.header.scale
+        data.offset = las.header.offset
 
     # Populate data with point RGB colors
     if rgb:
@@ -117,16 +117,16 @@ def read_vancouver_tile(
 #%%
 # filepath = '/home/data/assets/Hybernska-data/Office_points_all.laz'
 # filepath = '/home/data/assets/COOP/roof.las'
-filepath = '/home/data/assets/poly/NP2_cast1.laz'
+# filepath = '/home/data/assets/poly/NP2_cast1.laz'
+filepath = '/home/io/Mesice/general_pano_5514_v8211_Merge.las'
 columns=['position', 'intensity', 'rgb']
 data = read_vancouver_tile(filepath, semantic=False)
 
 print("Data loaded in ", time.time() - start_time, "s")
 end_cpu_mem, end_gpu_alloc, end_gpu_reserved = get_memory_usage()
 print("Memory usage: CPU: ", end_cpu_mem - start_memory[0], "MB, GPU: ", end_gpu_alloc - start_memory[1], "MB")
+# print(f"Memory footprint of data: {sys.getsizeof(data) / (1024 * 1024):.2f} MB, ")
 
-#%%
-data
 #%%
 from src.utils import init_config
 
@@ -148,18 +148,22 @@ cfg = init_config(overrides=[f"experiment=semantic/s3dis"])
 model = hydra.utils.instantiate(cfg.model)
 model = model._load_from_checkpoint(ckpt_path)
 
-#%%
-# Save the pointcloud to a las file
-las = laspy.read(filepath)
-
 # Create a descriptive output filename from the input filepath
 
 out_path = os.path.join(
     os.path.dirname(filepath),
     os.path.basename(filepath).replace('.las', '_semantic.las').replace('.laz', '_semantic.las'))
 
-out_las = laspy.create(point_format=las.header.point_format, file_version=las.header.version)
-del las
+
+# --- Use a new header and add extra dims for tile and cluster ---
+import numpy as np
+header = laspy.LasHeader(point_format=3, version="1.4")
+# header = las.header
+header.add_extra_dim(laspy.ExtraBytesParams(name="Tile", type=np.uint8, description="Tile index for recursive tiling"))
+header.add_extra_dim(laspy.ExtraBytesParams(name="Cluster", type=np.uint32, description="Cluster index for NAG"))
+header.offsets = data.offsets
+header.scales = data.scales
+# del las
 
 #%%
 from src.transforms import SampleRecursiveMainXYAxisTiling
@@ -167,82 +171,100 @@ from src.transforms import NAGRemoveKeys
 
 # Recursively tile the cloud into `2**pc_tiling` chunks with respect to
 # principal components of the XY coordiantes
-pc_tiling = 2
+pc_tiling = 3
 
 columns.extend(['tile', 'label'])
-pointcloud = pd.DataFrame(columns=columns)
+# pointcloud = pd.DataFrame(columns=columns)  # REMOVE this line
+# pointcloud_chunks = []  # REMOVE this line
 
 loop_time = time.time()
 
 # Compute each chunk
 chunks = []
-for x in range(2**pc_tiling):
-    iter_time = time.time()
-    print("Chunk ", x+1, " of ", 2**pc_tiling, " started")
-    end_cpu_mem, end_gpu_alloc, end_gpu_reserved = get_memory_usage()
-    print("Memory usage: CPU: ", end_cpu_mem - start_memory[0], "MB, GPU: ", end_gpu_alloc - start_memory[1], "MB")
-    # Extract the chunk at x in the recursive tiling
-    chunk = SampleRecursiveMainXYAxisTiling(x=x, steps=pc_tiling)(data)
+with laspy.open(out_path, mode="w", header=header) as writer:
+    for x in range(2**pc_tiling):
+        # if x == 2:
+        #     break
+        iter_time = time.time()
+        print("Chunk ", x+1, " of ", 2**pc_tiling, " started")
+        end_cpu_mem, end_gpu_alloc, end_gpu_reserved = get_memory_usage()
+        print("Memory usage: CPU: ", end_cpu_mem - start_memory[0], "MB, GPU: ", end_gpu_alloc - start_memory[1], "MB")
+        # Extract the chunk at x in the recursive tiling
+        chunk = SampleRecursiveMainXYAxisTiling(x=x, steps=pc_tiling)(data)
 
-    # Add a 'tile' attribute to the points for visualization
-    chunk.tile = torch.full((chunk.num_points,), x)
+        # Add a 'tile' attribute to the points for visualization
+        chunk.tile = torch.full((chunk.num_points,), x)
 
-    nag = transforms_dict['pre_transform'](chunk)
+        nag = transforms_dict['pre_transform'](chunk)
+        nag = NAGRemoveKeys(level='1+', keys=[k for k in nag[1].keys if k not in cfg.datamodule.segment_load_keys])(nag)
+        nag = nag.cuda()
+        nag = transforms_dict['on_device_test_transform'](nag)
+        model = model.eval().to(nag.device)
+        with torch.no_grad():
+            output = model(nag)
+        print("...done")
 
-    # Simulate the behavior of the dataset's I/O behavior with only
-    # `point_load_keys` and `segment_load_keys` loaded from disk
-    nag = NAGRemoveKeys(level=0, keys=[k for k in nag[0].keys if k not in cfg.datamodule.point_load_keys])(nag)
-    nag = NAGRemoveKeys(level='1+', keys=[k for k in nag[1].keys if k not in cfg.datamodule.segment_load_keys])(nag)
+        raw_semseg_y = output.full_res_semantic_pred(
+            super_index_level0_to_level1=nag[0].super_index,
+            sub_level0_to_raw=nag[0].sub)
 
-    # Move to device
-    nag = nag.cuda()
+        # Prepare numpy arrays for laspy
+        pos_np = chunk.pos.cpu().numpy().astype(np.float32)
+        rgb_np = chunk.rgb.cpu().numpy().astype(np.float32)
+        intensity_np = chunk.intensity.cpu().numpy().astype(np.float32)
+        label_np = raw_semseg_y.cpu().numpy().astype(np.uint8)
+        tile_np = np.full((chunk.num_points,), x, dtype=np.uint8)
+        cluster_np = nag[0].sub.to_super_index().cpu().numpy().astype(np.uint32)
 
-    # Apply on-device transforms
-    nag = transforms_dict['on_device_test_transform'](nag)
+        las_chunk = laspy.LasData(header)
+        las_chunk.x = pos_np[:, 0]
+        las_chunk.y = pos_np[:, 1]
+        las_chunk.z = pos_np[:, 2]
+        las_chunk.red = (65535 * rgb_np[:, 0]).astype(np.uint16)
+        las_chunk.green = (65535 * rgb_np[:, 1]).astype(np.uint16)
+        las_chunk.blue = (65535 * rgb_np[:, 2]).astype(np.uint16)
+        las_chunk.intensity = (65535 * intensity_np).astype(np.uint16)
+        las_chunk.classification = label_np.astype(np.uint8)
+        las_chunk.tile = tile_np
+        las_chunk.cluster = cluster_np
 
-    # Set the model in inference mode on the same device as the input
-    model = model.eval().to(nag.device)
 
-    # Inference, returns a task-specific ouput object carrying predictions
-    with torch.no_grad():
-        output = model(nag)
+#         print(f"Memory footprint of las_chunk: {sys.getsizeof(las_chunk) / (1024 * 1024):.2f} MB, ")
+#         print(f"Memory footprint of nag: {sys.getsizeof(nag) / (1024 * 1024):.2f} MB, ")
+#         print(f"Memory footprint of chunk: {sys.getsizeof(chunk) / (1024 * 1024):.2f} MB, ")
 
-    print("...done")
+        writer.write_points(las_chunk.points)
 
-    raw_semseg_y = output.full_res_semantic_pred(
-        super_index_level0_to_level1=nag[0].super_index,
-        sub_level0_to_raw=nag[0].sub)
+        # Explicitly delete large objects and clear CUDA cache
+        del chunk, nag, output, raw_semseg_y, las_chunk, pos_np, rgb_np, intensity_np, label_np, tile_np, cluster_np
+        torch.cuda.empty_cache()
 
-    # append the chunk data to the pointcloud for each column
-    chunk_data =pd.DataFrame({
-        'position': chunk.pos.cpu().numpy().tolist(),
-        'intensity': chunk.intensity.cpu().numpy().tolist(),
-        'rgb': chunk.rgb.cpu().numpy().tolist(),
-        'label': raw_semseg_y.cpu().numpy().tolist(),
-        'tile': np.full((chunk.num_points,), x)
-    })
-    pointcloud = pd.concat([pointcloud, chunk_data])
+        print("Chunk ", x+1, " of ", 2**pc_tiling, " done in ", time.time() - iter_time, "s")
+        print("Total time elapsed: ", time.time() - loop_time, "s")
 
-    print("Chunk ", x+1, " of ", 2**pc_tiling, " done in ", time.time() - iter_time, "s")
-    print("Total time elapsed: ", time.time() - loop_time, "s")
+        end_cpu_mem, end_gpu_alloc, end_gpu_reserved = get_memory_usage()
+        print("Memory usage: CPU: ", end_cpu_mem - start_memory[0], "MB, GPU: ", end_gpu_alloc - start_memory[1], "MB")
 
-    end_cpu_mem, end_gpu_alloc, end_gpu_reserved = get_memory_usage()
-    print("Memory usage: CPU: ", end_cpu_mem - start_memory[0], "MB, GPU: ", end_gpu_alloc - start_memory[1], "MB")
+        # if x == 2:
+        #     break
 
-    # if x == 2:
-    #     break
+# REMOVE: Concatenate all chunks at once (much more memory efficient)
+# pointcloud = pd.concat(pointcloud_chunks, ignore_index=True)
+# del pointcloud_chunks
 
-out_las.x = pointcloud['position'].apply(lambda x: x[0])
-out_las.y = pointcloud['position'].apply(lambda x: x[1])
-out_las.z = pointcloud['position'].apply(lambda x: x[2])
-out_las.red = pointcloud['rgb'].apply(lambda x: int(65535 * x[0]))
-out_las.green = pointcloud['rgb'].apply(lambda x: int(65535 * x[1]))
-out_las.blue = pointcloud['rgb'].apply(lambda x: int(65535 * x[2]))
-out_las.intensity = pointcloud['intensity'].apply(lambda x: int(65535 * x))
-out_las.classification = pointcloud['label']
-out_las.segment = pointcloud['tile']
-out_las.write(out_path)
-del pointcloud
+# REMOVE: Assign fields to the new LAS object
+# out_las.x = pointcloud['position'].apply(lambda x: x[0])
+# out_las.y = pointcloud['position'].apply(lambda x: x[1])
+# out_las.z = pointcloud['position'].apply(lambda x: x[2])
+# out_las.red = pointcloud['rgb'].apply(lambda x: int(65535 * x[0]))
+# out_las.green = pointcloud['rgb'].apply(lambda x: int(65535 * x[1]))
+# out_las.blue = pointcloud['rgb'].apply(lambda x: int(65535 * x[2]))
+# out_las.intensity = pointcloud['intensity'].apply(lambda x: int(65535 * x))
+# out_las.classification = pointcloud['label']
+# out_las.tile = pointcloud['tile'].astype(np.int32)
+# out_las.cluster = pointcloud['cluster'].astype(np.int32)
+# out_las.write(out_path)
+# del pointcloud
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -294,13 +316,14 @@ def generate_views(las, output_dir="output_views"):
             plot_top_down(x[mask], y[mask], label, output_dir)
 
     # Generate a single view for the tile variable (if exists)
-    if hasattr(las, "tile"):
-        unique_tiles = np.unique(las.tile)
-        print(f"Unique tiles: {unique_tiles}")
-        colormap = cm.get_cmap("tab10", len(unique_tiles))  # Use tab10 for distinct colors
-        color_dict = {tile: colormap(i) for i, tile in enumerate(unique_tiles)}
-        colors = np.array([color_dict[tile] for tile in las.tile])
-        plot_top_down(x, y, "tile_view", output_dir, colors=colors)
+    # if hasattr(las, "tile"):
+    #     unique_tiles, tile_indices = np.unique(las.tile, return_inverse=True)  # Get unique tiles and their indices
+    #     print(f"Unique tiles: {unique_tiles}")
+    #
+    #     colormap = plt.get_cmap("tab10", len(unique_tiles))  # Use tab10 for distinct colors
+    #     colors = colormap(tile_indices)  # Directly map indices to colors using the colormap
+    #
+    #     plot_top_down(x, y, "tile_view", output_dir, colors=colors)
 
 print('Saving the output las file...')
 print('Output path: ', out_path)
@@ -309,7 +332,8 @@ mem = get_memory_usage()
 print("Memory usage: CPU: ", mem[0] - start_memory[0], "MB, GPU: ", mem[1] - start_memory[1], "MB")
 
 # Create folder views
-out_folder = os.path.join(os.path.dirname(filepath), 'views_' + os.path.basename(filepath).split('.')[0])
-
-# Generate views
-generate_views(out_las, out_folder)
+# out_folder = os.path.join(os.path.dirname(filepath), 'views_' + os.path.basename(filepath).split('.')[0])
+#
+# # Generate views
+# generate_views(out_las, out_folder)
+# print('Final time elapsed: ', time.time() - start_time, 's')

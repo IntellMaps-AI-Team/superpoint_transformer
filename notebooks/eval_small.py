@@ -9,6 +9,7 @@ sys.path.append(file_path)
 
 import laspy
 import torch
+import numpy as np
 from src.data import Data
 from src.utils.color import to_float_rgb
 
